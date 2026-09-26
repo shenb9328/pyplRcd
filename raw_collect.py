@@ -17,8 +17,11 @@ import argparse
 import base64
 import json
 import os
+import queue
 import sys
+import threading
 import time
+import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -56,19 +59,27 @@ SOURCES = [
         "name": "polymarket",
         "url": "https://clob.polymarket.com/sampling-markets",
         "params": {"next_cursor": "MA=="},
+        "pages": 3,
+        "cursor_param": "next_cursor",
+        "response_cursor_key": "next_cursor",
+        "terminal_cursors": ["LTE=", ""],
     },
     {
         "name": "kalshi",
         "url": "https://api.elections.kalshi.com/trade-api/v2/events",
         "params": {
-            "limit": 100,
+            "limit": 200,
             "status": "open",
             "with_nested_markets": "true",
         },
+        "pages": 2,
+        "cursor_param": "cursor",
+        "response_cursor_key": "cursor",
+        "terminal_cursors": ["", None],
     },
     {
         "name": "kraken",
-        "url": "https://api.kraken.com/0/public/AssetPairs",
+        "url": "https://api.kraken.com/0/public/Ticker",
         "params": {},
     },
 ]
@@ -132,6 +143,66 @@ class RawWriter:
         self.path = None
         self.bucket = None
         return old
+
+
+# ---------------------------------------------------------------------------
+# Background Async Zip Compressor
+# ---------------------------------------------------------------------------
+
+class AsyncCompressor:
+    def __init__(self, compress_level: int = 6) -> None:
+        self.compress_level = compress_level
+        self.queue: queue.Queue[Path | None] = queue.Queue()
+        self.thread = threading.Thread(target=self._worker, daemon=True)
+        self.thread.start()
+
+    def submit(self, path: Path) -> None:
+        if path.exists() and path.stat().st_size > 0:
+            self.queue.put(path)
+
+    def _worker(self) -> None:
+        while True:
+            path = self.queue.get()
+            if path is None:
+                self.queue.task_done()
+                break
+            try:
+                self._compress_file(path)
+            except Exception as exc:
+                print(f"[compress FAILED] {path}: {exc}", file=sys.stderr)
+            finally:
+                self.queue.task_done()
+
+    def _compress_file(self, path: Path) -> None:
+        if not path.exists():
+            return
+        orig_size = path.stat().st_size
+        if orig_size == 0:
+            return
+
+        zip_path = path.with_suffix(".zip")
+        tmp_zip = path.with_suffix(".zip.tmp")
+
+        t0 = time.monotonic()
+        with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=self.compress_level) as zf:
+            zf.write(path, arcname=path.name)
+
+        tmp_zip.replace(zip_path)
+        t_taken = time.monotonic() - t0
+        zip_size = zip_path.stat().st_size
+        ratio = (zip_size / orig_size) * 100 if orig_size else 100.0
+
+        path.unlink(missing_ok=True)
+        print(
+            f"[compressed] {path.name} -> {zip_path.name} "
+            f"({orig_size / 1024 / 1024:.1f}MB -> {zip_size / 1024 / 1024:.1f}MB, "
+            f"{ratio:.1f}%) in {t_taken:.2f}s, original removed."
+        )
+
+    def close(self) -> None:
+        self.queue.join()
+        self.queue.put(None)
+        self.thread.join(timeout=60)
 
 
 # ---------------------------------------------------------------------------
@@ -248,51 +319,70 @@ def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = N
 # Raw HTTP collection
 # ---------------------------------------------------------------------------
 
-def collect_one(session: requests.Session, source: dict[str, Any]) -> dict[str, Any]:
-    start = time.monotonic_ns()
+def collect_source(session: requests.Session, source: dict[str, Any]) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    max_pages = source.get("pages", 1)
+    cursor_param = source.get("cursor_param")
+    resp_cursor_key = source.get("response_cursor_key")
+    terminal_cursors = set(source.get("terminal_cursors") or ["", None])
 
-    try:
-        r = session.get(
-            source["url"],
-            params=source.get("params") or {},
-            timeout=HTTP_TIMEOUT,
-        )
-        latency_ms = (time.monotonic_ns() - start) / 1_000_000
+    current_params = dict(source.get("params") or {})
 
-        # Preserve the response body itself. Do not parse and re-serialize it.
-        # This keeps the API response as close to the received bytes as possible.
-        payload = r.text
+    for page_idx in range(max_pages):
+        start = time.monotonic_ns()
+        try:
+            r = session.get(
+                source["url"],
+                params=current_params,
+                timeout=HTTP_TIMEOUT,
+            )
+            latency_ms = (time.monotonic_ns() - start) / 1_000_000
+            payload = r.text
 
-        record: dict[str, Any] = {
-            "receive_ts": now_iso(),
-            "source_ts": None,
-            "exchange": source["name"],
-            "url": r.url,
-            "fetch_latency_ms": round(latency_ms, 3),
-            "http_status": r.status_code,
-            "payload": payload,
-        }
+            record: dict[str, Any] = {
+                "receive_ts": now_iso(),
+                "source_ts": None,
+                "exchange": source["name"],
+                "url": r.url,
+                "page": page_idx + 1 if max_pages > 1 else None,
+                "fetch_latency_ms": round(latency_ms, 3),
+                "http_status": r.status_code,
+                "payload": payload,
+            }
+            records.append(record)
 
-        return record
+            if page_idx + 1 < max_pages and cursor_param and resp_cursor_key:
+                try:
+                    data = r.json()
+                    next_cur = data.get(resp_cursor_key)
+                    if not next_cur or next_cur in terminal_cursors:
+                        break
+                    current_params[cursor_param] = next_cur
+                except Exception:
+                    break
 
-    except Exception as exc:
-        latency_ms = (time.monotonic_ns() - start) / 1_000_000
-        return {
-            "receive_ts": now_iso(),
-            "source_ts": None,
-            "exchange": source["name"],
-            "url": build_url(source),
-            "fetch_latency_ms": round(latency_ms, 3),
-            "http_status": None,
-            "error": {
-                "type": type(exc).__name__,
-                "message": str(exc),
-            },
-        }
+        except Exception as exc:
+            latency_ms = (time.monotonic_ns() - start) / 1_000_000
+            records.append({
+                "receive_ts": now_iso(),
+                "source_ts": None,
+                "exchange": source["name"],
+                "url": build_url(source, current_params),
+                "page": page_idx + 1 if max_pages > 1 else None,
+                "fetch_latency_ms": round(latency_ms, 3),
+                "http_status": None,
+                "error": {
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                },
+            })
+            break
+
+    return records
 
 
-def build_url(source: dict[str, Any]) -> str:
-    params = source.get("params") or {}
+def build_url(source: dict[str, Any], params_override: dict[str, Any] | None = None) -> str:
+    params = params_override if params_override is not None else (source.get("params") or {})
     if not params:
         return source["url"]
     return source["url"] + "?" + urlencode(params)
@@ -310,18 +400,81 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Run for this many hours. 0 means run until Ctrl-C.",
     )
+    p.add_argument(
+        "--seconds",
+        type=float,
+        default=0,
+        help="Run for this many seconds (for short test runs).",
+    )
+    p.add_argument(
+        "--local-only",
+        action="store_true",
+        default=True,
+        help="Save data locally only, do not upload to GitHub or delete files (default: True).",
+    )
+    p.add_argument(
+        "--upload",
+        action="store_true",
+        default=False,
+        help="Enable uploading completed 5-minute files to GitHub (requires GITHUB_TOKEN).",
+    )
+    p.add_argument(
+        "--zip",
+        dest="do_zip",
+        action="store_true",
+        default=True,
+        help="Compress completed 5-minute jsonl files into .zip and delete the original (default: True).",
+    )
+    p.add_argument(
+        "--no-zip",
+        dest="do_zip",
+        action="store_false",
+        help="Disable automatic zip compression.",
+    )
+    p.add_argument(
+        "--compress-level",
+        type=int,
+        default=6,
+        help="Zip compression level (1-9, default: 6).",
+    )
+    p.add_argument(
+        "--poll",
+        type=float,
+        default=POLL_SECONDS,
+        help=f"Poll interval in seconds (default: {POLL_SECONDS:g}s).",
+    )
+    p.add_argument(
+        "--data-dir",
+        type=str,
+        default=str(DATA_DIR),
+        help=f"Directory to save raw jsonl/zip files (default: {DATA_DIR}).",
+    )
     return p.parse_args()
 
 
 def main() -> int:
     args = parse_args()
 
-    token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
-    if not token:
-        print("ERROR: set GITHUB_TOKEN (or GH_TOKEN) with Contents: write permission.", file=sys.stderr)
-        return 2
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
 
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    poll_interval = max(0.5, args.poll)
+    should_upload = args.upload and not args.local_only
+
+    github: GitHubUploader | None = None
+    if should_upload:
+        token = os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN")
+        if not token:
+            print("ERROR: --upload requested but GITHUB_TOKEN (or GH_TOKEN) is not set.", file=sys.stderr)
+            return 2
+        github = GitHubUploader(REPO, BRANCH, token)
+
+    compressor = AsyncCompressor(compress_level=args.compress_level) if args.do_zip else None
+
+    # Enqueue any leftover uncompressed jsonl files from previous runs
+    if compressor is not None:
+        for old_file in data_dir.glob("*.jsonl"):
+            compressor.submit(old_file)
 
     http = requests.Session()
     http.headers.update(
@@ -331,21 +484,36 @@ def main() -> int:
         }
     )
 
-    github = GitHubUploader(REPO, BRANCH, token)
-    writer = RawWriter(DATA_DIR)
+    writer = RawWriter(data_dir)
 
     started = time.monotonic()
     next_poll = time.monotonic()
 
-    print(f"recording -> {REPO}")
-    print(f"local data -> {DATA_DIR}")
+    run_duration_desc = ""
+    if args.seconds > 0:
+        run_duration_desc = f"{args.seconds:g}s"
+    elif args.hours > 0:
+        run_duration_desc = f"{args.hours:g}h"
+    else:
+        run_duration_desc = "continuous"
+
+    print(f"mode -> {'upload to GitHub' if should_upload else 'local storage only (data preserved)'}")
+    print(f"local data -> {data_dir.resolve()}")
     print(f"sources -> {len(SOURCES)}")
-    print(f"poll -> every {POLL_SECONDS:g}s")
-    print("upload -> every completed 5-minute file")
+    print(f"poll -> every {poll_interval:g}s")
+    print(f"duration -> {run_duration_desc}")
+    print(f"compression -> {'enabled (.zip async, level %d)' % args.compress_level if args.do_zip else 'disabled'}")
+    if should_upload:
+        print(f"upload target -> {REPO}:{BRANCH}")
+    else:
+        print("upload -> disabled (preserving all files locally)")
 
     try:
         while True:
-            if args.hours > 0 and time.monotonic() - started >= args.hours * 3600:
+            elapsed = time.monotonic() - started
+            if args.seconds > 0 and elapsed >= args.seconds:
+                break
+            if args.hours > 0 and elapsed >= args.hours * 3600:
                 break
 
             now = time.time()
@@ -355,19 +523,32 @@ def main() -> int:
                 current_bucket = file_name_for(now)
                 if writer.bucket != current_bucket:
                     finished = writer.close()
-                    upload_pending(github, DATA_DIR)
+                    if finished:
+                        print(f"[rotate] closed {finished.name}")
+                        if compressor is not None:
+                            compressor.submit(finished)
+                    if should_upload and github is not None:
+                        upload_pending(github, data_dir)
 
-            # One raw request per configured source. Nothing is parsed for decisions.
+            # Raw requests per configured source (with pagination support).
             for source in SOURCES:
-                record = collect_one(http, source)
-                writer.write(record, time.time())
-                print(
-                    f"{record['exchange']} "
-                    f"{record.get('http_status')} "
-                    f"{record['fetch_latency_ms']}ms"
-                )
+                records = collect_source(http, source)
+                for record in records:
+                    writer.write(record, time.time())
+                    status = record.get("http_status")
+                    err = record.get("error", {}).get("type") if "error" in record else None
+                    status_str = str(status) if status is not None else f"ERR:{err}"
+                    name_with_page = record["exchange"]
+                    if record.get("page"):
+                        name_with_page += f"(p{record['page']})"
+                    print(
+                        f"[{record['receive_ts'][:19]}] "
+                        f"{name_with_page:<18} "
+                        f"{status_str:<6} "
+                        f"{record['fetch_latency_ms']}ms"
+                    )
 
-            next_poll += POLL_SECONDS
+            next_poll += poll_interval
             sleep_for = next_poll - time.monotonic()
             if sleep_for > 0:
                 time.sleep(sleep_for)
@@ -378,8 +559,19 @@ def main() -> int:
         print("\nstopped by user")
 
     finally:
-        writer.close()
-        upload_pending(github, DATA_DIR)
+        finished = writer.close()
+        if finished:
+            print(f"[final] closed {finished.name}")
+            if compressor is not None:
+                compressor.submit(finished)
+
+        if compressor is not None:
+            print("[shutdown] waiting for background compression to complete...")
+            compressor.close()
+            print("[shutdown] compression complete.")
+
+        if should_upload and github is not None:
+            upload_pending(github, data_dir)
 
         http.close()
 
