@@ -160,22 +160,6 @@ class GitHubUploader:
             raise RuntimeError(f"GitHub {method} {url} -> {r.status_code}: {r.text[:1000]}")
         return r.json()
 
-def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = None) -> None:
-    """Upload every completed local JSONL file that is not the active file."""
-    for path in sorted(data_dir.glob("*.jsonl")):
-        if keep is not None and path == keep:
-            continue
-        if not path.exists() or path.stat().st_size == 0:
-            continue
-        try:
-            sha = github.upload(path)
-            print(f"uploaded {path.name} -> {sha[:12]}")
-            path.unlink()
-        except Exception as exc:
-            # Keep the file. The next 5-minute rotation will retry it.
-            print(f"UPLOAD FAILED {path}: {exc}", file=sys.stderr)
-
-
     def upload(self, local_path: Path) -> str:
         content = local_path.read_bytes()
 
@@ -241,6 +225,23 @@ def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = N
         )
 
         return commit["sha"]
+
+
+def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = None) -> None:
+    """Upload every completed local JSONL file that is not the active file."""
+    for path in sorted(data_dir.glob("*.jsonl")):
+        if keep is not None and path == keep:
+            continue
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        try:
+            sha = github.upload(path)
+            print(f"uploaded {path.name} -> {sha[:12]}")
+            path.unlink()
+        except Exception as exc:
+            # Keep the file. The next 5-minute rotation will retry it.
+            print(f"UPLOAD FAILED {path}: {exc}", file=sys.stderr)
+
 
 
 # ---------------------------------------------------------------------------
