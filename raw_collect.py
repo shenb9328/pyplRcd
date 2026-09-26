@@ -265,8 +265,8 @@ def collect_one(session: requests.Session, source: dict[str, Any]) -> dict[str, 
         payload = r.text
 
         record: dict[str, Any] = {
-            "collector_ts": now_iso(),
-            "request_ts": request_ts,
+            "receive_ts": now_iso(),
+            "source_ts": None,
             "exchange": source["name"],
             "url": r.url,
             "fetch_latency_ms": round(latency_ms, 3),
@@ -279,8 +279,8 @@ def collect_one(session: requests.Session, source: dict[str, Any]) -> dict[str, 
     except Exception as exc:
         latency_ms = (time.monotonic_ns() - start) / 1_000_000
         return {
-            "collector_ts": now_iso(),
-            "request_ts": request_ts,
+            "receive_ts": now_iso(),
+            "source_ts": None,
             "exchange": source["name"],
             "url": build_url(source),
             "fetch_latency_ms": round(latency_ms, 3),
