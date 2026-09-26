@@ -249,7 +249,6 @@ def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = N
 # ---------------------------------------------------------------------------
 
 def collect_one(session: requests.Session, source: dict[str, Any]) -> dict[str, Any]:
-    request_ts = now_iso()
     start = time.monotonic_ns()
 
     try:
