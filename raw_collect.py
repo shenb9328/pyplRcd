@@ -260,12 +260,9 @@ def collect_one(session: requests.Session, source: dict[str, Any]) -> dict[str, 
         )
         latency_ms = (time.monotonic_ns() - start) / 1_000_000
 
-        # Keep the response body as JSON when it is JSON.
-        # If an API returns non-JSON, preserve the text rather than dropping it.
-        try:
-            payload: Any = r.json()
-        except ValueError:
-            payload = r.text
+        # Preserve the response body itself. Do not parse and re-serialize it.
+        # This keeps the API response as close to the received bytes as possible.
+        payload = r.text
 
         record: dict[str, Any] = {
             "collector_ts": now_iso(),
