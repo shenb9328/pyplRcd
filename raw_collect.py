@@ -160,6 +160,22 @@ class GitHubUploader:
             raise RuntimeError(f"GitHub {method} {url} -> {r.status_code}: {r.text[:1000]}")
         return r.json()
 
+def upload_pending(github: GitHubUploader, data_dir: Path, keep: Path | None = None) -> None:
+    """Upload every completed local JSONL file that is not the active file."""
+    for path in sorted(data_dir.glob("*.jsonl")):
+        if keep is not None and path == keep:
+            continue
+        if not path.exists() or path.stat().st_size == 0:
+            continue
+        try:
+            sha = github.upload(path)
+            print(f"uploaded {path.name} -> {sha[:12]}")
+            path.unlink()
+        except Exception as exc:
+            # Keep the file. The next 5-minute rotation will retry it.
+            print(f"UPLOAD FAILED {path}: {exc}", file=sys.stderr)
+
+
     def upload(self, local_path: Path) -> str:
         content = local_path.read_bytes()
 
@@ -342,13 +358,7 @@ def main() -> int:
                 current_bucket = file_name_for(now)
                 if writer.bucket != current_bucket:
                     finished = writer.close()
-                    if finished and finished.exists() and finished.stat().st_size > 0:
-                        try:
-                            sha = github.upload(finished)
-                            print(f"uploaded {finished.name} -> {sha[:12]}")
-                            finished.unlink()
-                        except Exception as exc:
-                            print(f"UPLOAD FAILED {finished}: {exc}", file=sys.stderr)
+                    upload_pending(github, DATA_DIR)
 
             # One raw request per configured source. Nothing is parsed for decisions.
             for source in SOURCES:
@@ -371,14 +381,8 @@ def main() -> int:
         print("\nstopped by user")
 
     finally:
-        finished = writer.close()
-        if finished and finished.exists() and finished.stat().st_size > 0:
-            try:
-                sha = github.upload(finished)
-                print(f"uploaded final {finished.name} -> {sha[:12]}")
-                finished.unlink()
-            except Exception as exc:
-                print(f"FINAL UPLOAD FAILED {finished}: {exc}", file=sys.stderr)
+        writer.close()
+        upload_pending(github, DATA_DIR)
 
         http.close()
 
