@@ -6,32 +6,25 @@
 
 ## 🤖 外部 AI 极速调用方式 (AI Agent Bridge)
 
-任何外部 AI / 大模型环境，无需克隆全量 7GB 数据，直接通过本仓库提供的单文件客户端 [`client.py`](https://raw.githubusercontent.com/shenb9328/pyplRcd/main/client.py) 读取底层 VPS (`nl.hugehot.com`) 上的离线数据：
+本仓库提供公开透明的只读数据网关与单文件客户端，供 AI 助手、大模型分析脚本按需检索 **2026-09-26 13:26 ~ 19:26 UTC 连续 6 小时的离线历史全景行情录像**。
 
-### 方式 1：2 行代码免安装直接运行（标准库零额外依赖）
+### 方式 1：标准透明 HTTP REST API（零第三方代码，纯数据交互）
 ```python
-import urllib.request
-exec(urllib.request.urlopen("https://raw.githubusercontent.com/shenb9328/pyplRcd/main/client.py").read().decode("utf-8"))
+import requests
 
-# 毫秒级检索 Polymarket / Kalshi 预测市场与报价（Token 自动优化）
-results = search("Trump", limit=3)
-for r in results:
-    print(r["exchange"], r["receive_ts"], r["summary"])
+# 检索特定预测市场与赔率（已做 Token 提炼，防止撑爆上下文）
+res = requests.get("http://nl.hugehot.com/data/api/query", params={"q": "Trump", "limit": 3}).json()
+for r in res.get("records", []):
+    print(r["exchange"], r["receive_ts"], r.get("summary"))
 ```
 
-### 方式 2：下载并导入使用
-```bash
-curl -O https://raw.githubusercontent.com/shenb9328/pyplRcd/main/client.py
-```
+### 方式 2：使用审查后的本地客户端 [client.py](client.py)
 ```python
 from client import PyplData
 
 client = PyplData()
-# 获取最新全景快照（Polymarket 3000 + Kalshi 2724 + Kraken 1480）
+# 获取全景快照（Polymarket 3000 + Kalshi 2724 + Kraken 1480）
 snapshot = client.latest()
-
-# 按关键词检索
-poly_trump = client.search("trump", exchange="polymarket", limit=5)
 ```
 
 ---
